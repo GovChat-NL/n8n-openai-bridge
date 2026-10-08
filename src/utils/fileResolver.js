@@ -27,6 +27,10 @@
  * @param {import('../services/fileService')} fileService - FileService instance
  * @returns {Array<Object>} Messages with file references resolved to data URLs
  */
+const { getMimeTypeFromFilename } = require('./mimeTypes');
+
+const XLSX_MIME = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+
 function resolveFileReferences(messages, fileService) {
   if (!messages || !Array.isArray(messages)) {
     return messages;
@@ -71,11 +75,14 @@ function resolveAttachments(message, fileService) {
       continue;
     }
 
-    const dataUrl = bufferToDataUrl(fileContent.buffer, fileContent.metadata.filename);
-    fileParts.push({
-      type: 'image_url',
-      image_url: { url: dataUrl },
-    });
+    const filename = fileContent.metadata.filename;
+    const dataUrl = bufferToDataUrl(fileContent.buffer, filename);
+    const mimeType = getMimeTypeFromFilename(filename);
+    if (mimeType === XLSX_MIME) {
+      fileParts.push({ type: 'file', file: { filename, url: dataUrl } });
+    } else {
+      fileParts.push({ type: 'image_url', image_url: { url: dataUrl } });
+    }
   }
 
   if (fileParts.length === 0) {
@@ -141,8 +148,6 @@ function resolveContentParts(message, fileService) {
 
   return { ...message, content: resolvedContent };
 }
-
-const { getMimeTypeFromFilename } = require('./mimeTypes');
 
 /**
  * Convert a buffer to a base64 data URL

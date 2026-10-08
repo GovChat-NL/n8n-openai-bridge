@@ -303,3 +303,24 @@ describe('fileResolver', () => {
     });
   });
 });
+
+describe('XLSX attachment resolution', () => {
+  test('preserves a workbook attachment as a file part', () => {
+    const { resolveAttachments } = require('../../src/utils/fileResolver');
+    const fileService = {
+      getFileContent: () => ({ buffer: Buffer.from('PK'), metadata: { filename: 'report.xlsx' } }),
+    };
+    const result = resolveAttachments(
+      { role: 'user', content: 'edit this', attachments: [{ file_id: 'file-xlsx' }] },
+      fileService,
+    );
+    expect(result.attachments).toBeUndefined();
+    expect(result.content[1]).toEqual({
+      type: 'file',
+      file: {
+        filename: 'report.xlsx',
+        url: 'data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,UEs=',
+      },
+    });
+  });
+});

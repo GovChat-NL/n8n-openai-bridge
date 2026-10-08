@@ -23,6 +23,7 @@
  * - passthrough: Forward content as-is
  * - extract-json: Extract files to separate array with base64 data
  * - extract-multipart: Extract files for multipart/form-data upload
+ * - extract-xlsx-json: Preserve image parts while extracting only XLSX file parts
  * - disabled: Strip all file content
  */
 
@@ -89,18 +90,38 @@ function extractFilesFromMultimodal(message, messageIndex) {
   let fileIndex = 0;
 
   for (const part of message.content) {
-    if (part.type === 'image_url' && part.image_url?.url) {
-      const parsed = parseDataUrl(part.image_url.url);
-      if (parsed) {
-        const ext = getExtensionFromMimeType(parsed.mimeType);
-        files.push({
-          name: `message_${messageIndex}_file_${fileIndex}.${ext}`,
-          mimeType: parsed.mimeType,
-          data: parsed.data,
-        });
-        fileIndex++;
-      }
+    const isImage = part.type === 'image_url';
+    const isXlsxFile = part.type === 'file';
+    const dataUrl = isImage
+      ? part.image_url?.url
+      : isXlsxFile
+        ? part.file?.url || part.file_url?.url
+        : null;
+    if (!dataUrl) {
+      continue;
     }
+    const parsed = parseDataUrl(dataUrl);
+    if (!parsed) {
+      continue;
+    }
+    // The bridge keeps generic image behaviour unchanged, but only forwards
+    // XLSX documents as files. This avoids accidentally widening document
+    // exfiltration to n8n workflows that were never designed to handle them.
+    if (
+      isXlsxFile &&
+      parsed.mimeType !== 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    ) {
+      continue;
+    }
+    const suppliedName = part.file?.filename || part.file_url?.filename || part.filename;
+    const ext = getExtensionFromMimeType(parsed.mimeType);
+    const sanitizedName =
+      typeof suppliedName === 'string' ? suppliedName.trim().replace(/[\\/\x00-\x1f]/g, '_') : '';
+    const name = sanitizedName
+      ? sanitizedName.slice(0, 200)
+      : `message_${messageIndex}_file_${fileIndex}.${ext}`;
+    files.push({ name, mimeType: parsed.mimeType, data: parsed.data });
+    fileIndex++;
   }
 
   return files;
@@ -137,11 +158,22 @@ function processMessages(messages, mode) {
         ...message,
         content: textContent,
       });
+    } else if (mode === 'extract-xlsx-json') {
+      // Keep image content intact for existing vision workflows while forwarding
+      // only the bounded XLSX attachment bytes in the separate files array.
+      const files = extractFilesFromMultimodal(message, i).filter(
+        (file) =>
+          file.mimeType === 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      );
+      allFiles.push(...files);
+      processedMessages.push({
+        ...message,
+        content: message.content.filter((part) => part.type !== 'file'),
+      });
     } else {
       // extract-json or extract-multipart
       const files = extractFilesFromMultimodal(message, i);
       allFiles.push(...files);
-
       processedMessages.push({
         ...message,
         content: textContent,
