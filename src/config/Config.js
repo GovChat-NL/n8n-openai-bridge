@@ -87,7 +87,13 @@ class Config {
    * Valid file upload modes
    * @type {string[]}
    */
-  static FILE_UPLOAD_MODES = ['passthrough', 'extract-json', 'extract-multipart', 'disabled'];
+  static FILE_UPLOAD_MODES = [
+    'passthrough',
+    'extract-json',
+    'extract-multipart',
+    'extract-xlsx-json',
+    'disabled',
+  ];
 
   /**
    * Parse FILE_UPLOAD_MODE from environment variable
