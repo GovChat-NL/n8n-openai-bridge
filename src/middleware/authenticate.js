@@ -70,7 +70,9 @@ function authenticate(config) {
     // The internal OpenAI-compatible tool proxy accepts its configured upstream
     // API key as well. This lets n8n retain its upstream credential while public
     // client-facing routes remain bridge-token protected.
-    const isOpenaiToolProxyRequest = req.originalUrl.startsWith('/openai-tool-proxy/');
+    const isOpenaiToolProxyRequest = String(req.originalUrl || req.url || '').startsWith(
+      '/openai-tool-proxy/',
+    );
     const validBridgeToken = timingSafeEqual(token, config.bearerToken);
     const validOpenaiToolProxyToken =
       isOpenaiToolProxyRequest &&
