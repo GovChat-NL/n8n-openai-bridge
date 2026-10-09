@@ -19,7 +19,11 @@
 const crypto = require('crypto');
 const { createStreamingChunk } = require('../utils/openaiResponse');
 const { createErrorResponse } = require('../utils/errorResponse');
-const { emitExternalToolCompletions } = require('../utils/externalToolEvents');
+const {
+  emitExternalToolCalls,
+  emitExternalToolCompletions,
+} = require('../utils/externalToolEvents');
+const { extractExternalToolMarkers } = require('../utils/n8nExternalToolMarkers');
 
 /**
  * Handles streaming chat completion requests
@@ -72,10 +76,16 @@ async function handleStreaming(
       streamId,
     );
 
-    for await (const content of streamGenerator) {
+    for await (const rawContent of streamGenerator) {
       if (closed || res.writableEnded || res.destroyed) {
         break;
       }
+
+      const { content, toolCalls } = extractExternalToolMarkers(rawContent);
+      if (toolCalls.length > 0) {
+        emitExternalToolCalls(activeStreamRegistry, streamId, model, toolCalls);
+      }
+
       /**
        * Tool calls are emitted asynchronously through the OpenAI-compatible upstream side-channel.
        * n8n may split the final answer into fragments before that side-channel
