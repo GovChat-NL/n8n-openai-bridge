@@ -74,6 +74,7 @@ router.post('/', async (req, res) => {
   const n8nClient = req.app.locals.n8nClient;
 
   const { model, messages, stream = false } = req.body;
+  const forceStreaming = req.headers.accept === 'text/event-stream';
 
   // SESSION ID DETECTION (Debug logging)
   debugSessionDetection(req, config);
@@ -105,11 +106,17 @@ router.post('/', async (req, res) => {
     console.log(`User Name: ${userContext.userName || 'not provided'}`);
     console.log(`User Role: ${userContext.userRole || 'not provided'}`);
     console.log(`Model: ${model}`);
-    console.log(`Stream: ${stream}`);
+    console.log(`Stream: ${stream || forceStreaming}`);
   }
 
   try {
-    if (stream) {
+    const runId = req.body.responseMessageId || req.body.conversationId || sessionId;
+    if (config.diagnosticLogging) {
+      console.log(
+        `[diag][bridge][${req.id || 'no-request-id'}] chat_completions stream=${stream || forceStreaming} model=${model} sessionId=${sessionId} runId=${runId} webhookUrl=${webhookUrl}`,
+      );
+    }
+    if (stream || forceStreaming) {
       await handleStreaming(
         res,
         n8nClient,
@@ -119,6 +126,7 @@ router.post('/', async (req, res) => {
         userContext,
         model,
         config,
+        runId,
       );
     } else {
       await handleNonStreaming(

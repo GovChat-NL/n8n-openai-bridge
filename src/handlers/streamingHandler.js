@@ -18,6 +18,7 @@
 
 const { createStreamingChunk } = require('../utils/openaiResponse');
 const { createErrorResponse } = require('../utils/errorResponse');
+const { encodeLibreChatStepEvent } = require('../utils/libreChatEventProtocol');
 
 /**
  * Handles streaming chat completion requests
@@ -30,6 +31,7 @@ const { createErrorResponse } = require('../utils/errorResponse');
  * @param {Object} userContext - User context data
  * @param {string} model - Model identifier
  * @param {Object} config - Configuration object
+ * @param {string} runId - Response/run identifier for LibreChat step events
  * @returns {Promise<void>}
  */
 async function handleStreaming(
@@ -41,27 +43,57 @@ async function handleStreaming(
   userContext,
   model,
   config,
+  runId,
 ) {
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
 
   try {
+    if (config.diagnosticLogging) {
+      console.log(
+        `[diag][bridge][streaming] start sessionId=${sessionId} runId=${runId} webhookUrl=${webhookUrl}`,
+      );
+    }
     const streamGenerator = n8nClient.streamCompletion(
       webhookUrl,
       messages,
       sessionId,
       userContext,
+      { runId, requestId: res.req?.id },
     );
 
     for await (const content of streamGenerator) {
+      if (content && typeof content === 'object' && content.kind === 'librechat_step_event') {
+        if (config.diagnosticLogging) {
+          console.log(
+            `[diag][bridge][${res.req?.id || 'no-request-id'}] sse_step_event event=${content.payload?.event || 'unknown'} runId=${runId}`,
+          );
+        }
+        // LangChain's OpenAI-compatible client ignores named SSE events. Carry
+        // this private control frame as ordinary content; LibreChat's agent
+        // callback overlay removes/decodes it before user-visible aggregation.
+        const chunk = createStreamingChunk(model, encodeLibreChatStepEvent(content.payload), null);
+        res.write('event: message\n');
+        res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+        continue;
+      }
+
       const chunk = createStreamingChunk(model, content, null);
+      if (config.diagnosticLogging) {
+        console.log(
+          `[diag][bridge][${res.req?.id || 'no-request-id'}] sse_text_chunk runId=${runId} preview=${JSON.stringify(String(content).slice(0, 120))}`,
+        );
+      }
+      res.write('event: message\n');
       res.write(`data: ${JSON.stringify(chunk)}\n\n`);
     }
 
     // Send final chunk
     const finalChunk = createStreamingChunk(model, null, 'stop');
+    res.write('event: message\n');
     res.write(`data: ${JSON.stringify(finalChunk)}\n\n`);
+    res.write('event: message\n');
     res.write('data: [DONE]\n\n');
     res.end();
 
@@ -71,6 +103,7 @@ async function handleStreaming(
   } catch (streamError) {
     console.error('Stream error:', streamError);
     const errorChunk = createErrorResponse('Error during streaming', 'server_error');
+    res.write('event: message\n');
     res.write(`data: ${JSON.stringify(errorChunk)}\n\n`);
     res.end();
   }

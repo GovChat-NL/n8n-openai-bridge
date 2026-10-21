@@ -72,6 +72,9 @@ class Config {
     const sep = process.env.AGENT_TURN_SEPARATOR;
     this.agentTurnSeparator =
       sep === undefined ? '\n\n' : sep.replace(/\\n/g, '\n').replace(/\\t/g, '\t');
+
+    // Diagnostic logging configuration
+    this.diagnosticLogging = process.env.DIAGNOSTIC_LOGGING === 'true';
   }
 
   /**
