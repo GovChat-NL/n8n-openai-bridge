@@ -123,6 +123,7 @@ class N8nClient {
     let hasYieldedContent = false;
     let pendingTurnSeparator = false;
     const turnSeparator = this.config.agentTurnSeparator ?? '\n\n';
+    const filterToolCallLogText = createToolCallLogTextFilter(this.MAX_BUFFER_SIZE);
 
     for await (const chunk of response.data) {
       const text = decoder.write(chunk);
@@ -139,7 +140,9 @@ class N8nClient {
         buffer = chunks.remainder;
 
         for (const jsonChunk of chunks.extracted) {
-          const { content, isEndOfTurn } = this.parseN8nChunk(jsonChunk);
+          const { content: parsedContent, isEndOfTurn } = this.parseN8nChunk(jsonChunk);
+          const content =
+            typeof parsedContent === 'string' ? filterToolCallLogText(parsedContent) : parsedContent;
 
           // Track agent turn boundaries to inject separators
           if (isEndOfTurn && hasYieldedContent) {
@@ -165,13 +168,23 @@ class N8nClient {
 
     // Process remaining buffer
     if (buffer.trim()) {
-      const { content } = this.parseN8nChunk(buffer.trim());
+      const { content: parsedContent } = this.parseN8nChunk(buffer.trim());
+      const content =
+        typeof parsedContent === 'string' ? filterToolCallLogText(parsedContent) : parsedContent;
       if (content) {
         if (pendingTurnSeparator && turnSeparator) {
           yield turnSeparator;
         }
         yield content;
       }
+    }
+
+    const remainingContent = filterToolCallLogText('', true);
+    if (remainingContent) {
+      if (pendingTurnSeparator && turnSeparator) {
+        yield turnSeparator;
+      }
+      yield remainingContent;
     }
   }
 
@@ -368,6 +381,124 @@ class N8nClient {
       return { content, isEndOfTurn: false };
     }
   }
+}
+
+function createToolCallLogTextFilter(maxBufferSize) {
+  const marker = 'Calling ';
+  const separator = ' with input: ';
+  let pending = '';
+
+  return (content = '', flush = false) => {
+    let input = pending + (typeof content === 'string' ? content : '');
+    pending = '';
+    let text = '';
+
+    while (input) {
+      const markerIndex = input.indexOf(marker);
+      if (markerIndex < 0) {
+        if (flush) {
+          text += input;
+          break;
+        }
+
+        let keepLength = 0;
+        const maxSuffixLength = Math.min(marker.length - 1, input.length);
+        for (let length = 1; length <= maxSuffixLength; length += 1) {
+          if (marker.startsWith(input.slice(-length))) {
+            keepLength = length;
+          }
+        }
+        text += input.slice(0, input.length - keepLength);
+        pending = input.slice(input.length - keepLength);
+        break;
+      }
+
+      text += input.slice(0, markerIndex);
+      const separatorIndex = input.indexOf(separator, markerIndex + marker.length);
+      if (separatorIndex < 0) {
+        const candidate = input.slice(markerIndex);
+        if (!flush && candidate.length <= maxBufferSize) {
+          pending = candidate;
+        } else {
+          text += candidate;
+        }
+        break;
+      }
+
+      const toolName = input.slice(markerIndex + marker.length, separatorIndex).trim();
+      const jsonStart = separatorIndex + separator.length;
+      if (toolName && jsonStart === input.length && !flush) {
+        pending = input.slice(markerIndex);
+        break;
+      }
+      if (!toolName || input[jsonStart] !== '{') {
+        text += input.slice(markerIndex, jsonStart);
+        input = input.slice(jsonStart);
+        continue;
+      }
+
+      const jsonEnd = findJsonObjectEnd(input, jsonStart);
+      if (jsonEnd < 0) {
+        const candidate = input.slice(markerIndex);
+        if (!flush && candidate.length <= maxBufferSize) {
+          pending = candidate;
+        } else {
+          text += candidate;
+        }
+        break;
+      }
+
+      let args;
+      try {
+        args = JSON.parse(input.slice(jsonStart, jsonEnd + 1));
+      } catch {
+        args = null;
+      }
+
+      if (args && typeof args === 'object' && !Array.isArray(args)) {
+        input = input.slice(jsonEnd + 1);
+      } else {
+        text += input.slice(markerIndex, jsonEnd + 1);
+        input = input.slice(jsonEnd + 1);
+      }
+    }
+
+    return text;
+  };
+}
+
+function findJsonObjectEnd(text, start) {
+  let depth = 0;
+  let inString = false;
+  let escapeNext = false;
+
+  for (let index = start; index < text.length; index += 1) {
+    const char = text[index];
+    if (escapeNext) {
+      escapeNext = false;
+      continue;
+    }
+    if (char === '\\' && inString) {
+      escapeNext = true;
+      continue;
+    }
+    if (char === '"') {
+      inString = !inString;
+      continue;
+    }
+    if (!inString) {
+      if (char === '{') {
+        depth += 1;
+      } else if (char === '}') {
+        depth -= 1;
+        if (depth === 0) {
+          return index;
+        }
+      }
+    }
+  }
+
+  return -1;
 }
 
 module.exports = N8nClient;

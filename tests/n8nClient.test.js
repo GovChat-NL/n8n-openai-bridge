@@ -241,6 +241,28 @@ describe('N8nClient', () => {
       expect(chunks).toEqual(['Hello ', '\n\nWorld']);
     });
 
+    test('should suppress streamed tool-call log text split across chunks', async () => {
+      const mockResponse = {
+        data: {
+          async *[Symbol.asyncIterator]() {
+            yield Buffer.from(`${JSON.stringify({ content: 'Calling' })}\n`);
+            yield Buffer.from(`${JSON.stringify({ content: ' Calculator with input: ' })}\n`);
+            yield Buffer.from(
+              `${JSON.stringify({ content: JSON.stringify({ input: '234723 /23', id: 'call_calc' }) })}\n`,
+            );
+            yield Buffer.from(`${JSON.stringify({ content: '234723 / 23 = 10205.34' })}\n`);
+          },
+        },
+      };
+
+      const chunks = [];
+      for await (const content of client.processResponseStream(mockResponse)) {
+        chunks.push(content);
+      }
+
+      expect(chunks.join('')).toBe('234723 / 23 = 10205.34');
+    });
+
     test('should preserve whitespace between agent turns in streaming', async () => {
       // Simulates n8n sending content from different agent turns
       // where trailing newlines separate paragraphs
