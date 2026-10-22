@@ -223,6 +223,305 @@ describe('N8nClient', () => {
   });
 
   describe('processResponseStream', () => {
+    test('should emit a LibreChat run step before streamed answer text when a tool starts', async () => {
+      const mockResponse = {
+        data: {
+          async *[Symbol.asyncIterator]() {
+            yield Buffer.from(
+              '{"type":"tool_call","id":"call_wait_1","name":"wait_test_tool","arguments":{"delayMs":3000}}\n',
+            );
+            yield Buffer.from('{"content":"Ik ga nu wachten."}\n');
+            yield Buffer.from(
+              '{"type":"tool_result","id":"call_wait_1","output":"wachten gelukt"}\n',
+            );
+          },
+        },
+      };
+
+      const chunks = [];
+      for await (const content of client.processResponseStream(mockResponse, { runId: 'resp-123' })) {
+        chunks.push(content);
+      }
+
+      expect(chunks[0]).toEqual({
+        kind: 'librechat_step_event',
+        payload: {
+          event: 'on_run_step',
+          data: {
+            id: 'step_call_wait_1',
+            index: 0,
+            runId: 'resp-123',
+            status: 'in_progress',
+            stepDetails: {
+              type: 'tool_calls',
+              tool_calls: [
+                {
+                  id: 'call_wait_1',
+                  type: 'tool_call',
+                  name: 'wait_test_tool',
+                  args: { delayMs: 3000 },
+                },
+              ],
+            },
+          },
+        },
+      });
+      expect(chunks[1]).toBe('Ik ga nu wachten.');
+      expect(chunks[2]).toEqual({
+        kind: 'librechat_step_event',
+        payload: {
+          event: 'on_run_step_completed',
+          data: {
+            result: {
+              id: 'step_call_wait_1',
+              completed_at: expect.any(Number),
+              tool_call: {
+                id: 'call_wait_1',
+                type: 'tool_call',
+                name: 'wait_test_tool',
+                args: { delayMs: 3000 },
+                output: 'wachten gelukt',
+                progress: 1,
+              },
+            },
+          },
+        },
+      });
+      expect(chunks[3]).toEqual({
+        kind: 'librechat_step_event',
+        payload: {
+          event: 'on_run_step_closed',
+          data: {
+            id: 'step_call_wait_1',
+            status: 'completed',
+            completed_at: expect.any(Number),
+          },
+        },
+      });
+    });
+
+    test('should assign increasing LibreChat indices to sequential tool calls', async () => {
+      const mockResponse = {
+        data: {
+          async *[Symbol.asyncIterator]() {
+            yield Buffer.from(
+              '{"type":"tool_call","id":"call_first","name":"first_tool","arguments":{}}\n',
+            );
+            yield Buffer.from('{"type":"tool_result","id":"call_first","output":"first"}\n');
+            yield Buffer.from(
+              '{"type":"tool_call","id":"call_second","name":"second_tool","arguments":{}}\n',
+            );
+            yield Buffer.from('{"type":"tool_result","id":"call_second","output":"second"}\n');
+          },
+        },
+      };
+
+      const stepIndices = [];
+      for await (const content of client.processResponseStream(mockResponse, { runId: 'resp-123' })) {
+        if (content?.kind === 'librechat_step_event' && content.payload.event === 'on_run_step') {
+          stepIndices.push(content.payload.data.index);
+        }
+      }
+
+      expect(stepIndices).toEqual([0, 1]);
+    });
+
+    test('should strip embedded tool-call JSON from mixed streamed assistant content', async () => {
+      const toolCallJson = JSON.stringify({
+        type: 'tool_call',
+        id: 'call_calc',
+        name: 'Calculator',
+        arguments: { input: '2343924 * 2347232' },
+      });
+      const splitAt = Math.floor(toolCallJson.length / 2);
+      const mockResponse = {
+        data: {
+          async *[Symbol.asyncIterator]() {
+            yield Buffer.from(
+              `${JSON.stringify({ content: `GoChat Orchestrator\n${toolCallJson.slice(0, splitAt)}` })}\n`,
+            );
+            yield Buffer.from(`${JSON.stringify({ content: toolCallJson.slice(splitAt) })}\n`);
+            yield Buffer.from(
+              `${JSON.stringify({ type: 'tool_result', id: 'call_calc', output: '5501733418368' })}\n`,
+            );
+          },
+        },
+      };
+
+      const chunks = [];
+      for await (const content of client.processResponseStream(mockResponse, { runId: 'resp-calc' })) {
+        chunks.push(content);
+      }
+
+      const text = chunks.filter((chunk) => typeof chunk === 'string').join('');
+      const events = chunks
+        .filter((chunk) => chunk?.kind === 'librechat_step_event')
+        .map((chunk) => chunk.payload);
+      expect(text).toBe('GoChat Orchestrator\n');
+      expect(events.map((event) => event.event)).toEqual([
+        'on_run_step',
+        'on_run_step_completed',
+        'on_run_step_closed',
+      ]);
+      expect(events[0].data.stepDetails.tool_calls[0]).toMatchObject({
+        id: 'call_calc',
+        name: 'Calculator',
+        args: { input: '2343924 * 2347232' },
+      });
+      expect(events[1].data.result.tool_call.output).toBe('5501733418368');
+    });
+
+    test('should remove streamed tool-call log text and preserve the final answer for sequential tools', async () => {
+      const mockResponse = {
+        data: {
+          async *[Symbol.asyncIterator]() {
+            yield Buffer.from(
+              `${JSON.stringify({ type: 'tool_call', id: 'call_wait', name: 'wait_test_tool', arguments: {} })}\n`,
+            );
+            yield Buffer.from(
+              `${JSON.stringify({ type: 'tool_result', id: 'call_wait', output: 'wachten gelukt' })}\n`,
+            );
+            yield Buffer.from(`${JSON.stringify({ content: 'Calling' })}\n`);
+            yield Buffer.from(`${JSON.stringify({ content: ' Calculator with input: ' })}\n`);
+            yield Buffer.from(`${JSON.stringify({ content: '{"input":"234723 /23"}' })}\n`);
+            yield Buffer.from(
+              `${JSON.stringify({ type: 'tool_call', id: 'call_calc', name: 'Calculator', arguments: { input: '234723 /23' } })}\n`,
+            );
+            yield Buffer.from(`${JSON.stringify({ content: 'wachten gelukt\n\n234723 / 23 = 10205.34' })}\n`);
+            yield Buffer.from(
+              `${JSON.stringify({ type: 'tool_result', id: 'call_calc', output: '10205.34' })}\n`,
+            );
+          },
+        },
+      };
+
+      const chunks = [];
+      for await (const content of client.processResponseStream(mockResponse, { runId: 'resp-sequential' })) {
+        chunks.push(content);
+      }
+
+      const text = chunks.filter((chunk) => typeof chunk === 'string').join('');
+      const starts = chunks
+        .filter((chunk) => chunk?.kind === 'librechat_step_event' && chunk.payload.event === 'on_run_step')
+        .map((chunk) => chunk.payload.data.stepDetails.tool_calls[0].name);
+      expect(starts).toEqual(['wait_test_tool', 'Calculator']);
+      expect(text).toBe('wachten gelukt\n\n234723 / 23 = 10205.34');
+      expect(text).not.toContain('Calling Calculator with input');
+    });
+
+    test('should interpret n8n tool_call and tool_result content wrappers as lifecycle events', async () => {
+      const callId = 'call_wrapped_tool';
+      const mockResponse = {
+        data: {
+          async *[Symbol.asyncIterator]() {
+            yield Buffer.from(
+              `${JSON.stringify({
+                type: 'tool_call',
+                content: JSON.stringify({
+                  type: 'tool_call',
+                  id: callId,
+                  name: 'Calculator',
+                  arguments: { input: '2343924 * 2347232' },
+                }),
+                metadata: { nodeName: 'AI Agent Orchestrator' },
+              })}\n`,
+            );
+            yield Buffer.from(
+              `${JSON.stringify({
+                type: 'tool_result',
+                content: JSON.stringify({
+                  type: 'tool_result',
+                  id: callId,
+                  name: 'Calculator',
+                  output: [],
+                }),
+                metadata: { nodeName: 'AI Agent Orchestrator' },
+              })}\n`,
+            );
+          },
+        },
+      };
+
+      const chunks = [];
+      for await (const content of client.processResponseStream(mockResponse, { runId: 'resp-wrapped' })) {
+        chunks.push(content);
+      }
+
+      const events = chunks
+        .filter((chunk) => chunk?.kind === 'librechat_step_event')
+        .map((chunk) => chunk.payload);
+      expect(chunks.filter((chunk) => typeof chunk === 'string')).toEqual([]);
+      expect(events.map((event) => event.event)).toEqual([
+        'on_run_step',
+        'on_run_step_completed',
+        'on_run_step_closed',
+      ]);
+      expect(events[1].data.result.tool_call).toMatchObject({
+        id: callId,
+        name: 'Calculator',
+        output: '',
+      });
+    });
+
+    test('should complete all active tool cards when the n8n stream ends without results', async () => {
+      const mockResponse = {
+        data: {
+          async *[Symbol.asyncIterator]() {
+            yield Buffer.from(
+              `${JSON.stringify({ type: 'tool_call', id: 'call_one', name: 'first_tool', arguments: {} })}\n`,
+            );
+            yield Buffer.from(
+              `${JSON.stringify({ type: 'tool_call', id: 'call_two', name: 'second_tool', arguments: {} })}\n`,
+            );
+          },
+        },
+      };
+
+      const chunks = [];
+      for await (const content of client.processResponseStream(mockResponse, { runId: 'resp-multi' })) {
+        chunks.push(content);
+      }
+
+      const events = chunks
+        .filter((chunk) => chunk?.kind === 'librechat_step_event')
+        .map((chunk) => chunk.payload);
+      expect(events.filter((event) => event.event === 'on_run_step')).toHaveLength(2);
+      expect(events.filter((event) => event.event === 'on_run_step_completed')).toHaveLength(2);
+      expect(
+        events
+          .filter((event) => event.event === 'on_run_step_completed')
+          .map((event) => event.data.result.tool_call.output),
+      ).toEqual(['', '']);
+    });
+
+    test('should surface tool errors and correlate results by tool name when the id is omitted', async () => {
+      const mockResponse = {
+        data: {
+          async *[Symbol.asyncIterator]() {
+            yield Buffer.from(
+              `${JSON.stringify({ type: 'tool_call', id: 'call_error', name: 'failing_tool', arguments: {} })}\n`,
+            );
+            yield Buffer.from(
+              `${JSON.stringify({ type: 'tool_error', name: 'failing_tool', error: 'runner unavailable' })}\n`,
+            );
+          },
+        },
+      };
+
+      const chunks = [];
+      for await (const content of client.processResponseStream(mockResponse, { runId: 'resp-error' })) {
+        chunks.push(content);
+      }
+
+      const completion = chunks.find(
+        (chunk) => chunk?.kind === 'librechat_step_event' && chunk.payload.event === 'on_run_step_completed',
+      );
+      expect(completion.payload.data.result.tool_call).toMatchObject({
+        id: 'call_error',
+        output: 'Tool failed: runner unavailable',
+      });
+    });
+
     test('should preserve whitespace in JSON content fields', async () => {
       const mockResponse = {
         data: {
@@ -430,38 +729,68 @@ describe('N8nClient', () => {
       const chunk = '{"content":"Hello world"}';
       const result = client.parseN8nChunk(chunk);
 
-      expect(result).toEqual({ content: 'Hello world', isEndOfTurn: false });
+      expect(result).toEqual({
+        content: 'Hello world',
+        isEndOfTurn: false,
+        toolCallStart: null,
+        toolCallEnd: null,
+        raw: { content: 'Hello world' },
+      });
     });
 
     test('should extract text from JSON chunk', () => {
       const chunk = '{"text":"Hello world"}';
       const result = client.parseN8nChunk(chunk);
 
-      expect(result).toEqual({ content: 'Hello world', isEndOfTurn: false });
+      expect(result).toEqual({
+        content: 'Hello world',
+        isEndOfTurn: false,
+        toolCallStart: null,
+        toolCallEnd: null,
+        raw: { text: 'Hello world' },
+      });
     });
 
     test('should extract output from JSON chunk', () => {
       const chunk = '{"output":"Hello world"}';
       const result = client.parseN8nChunk(chunk);
 
-      expect(result).toEqual({ content: 'Hello world', isEndOfTurn: false });
+      expect(result).toEqual({
+        content: 'Hello world',
+        isEndOfTurn: false,
+        toolCallStart: null,
+        toolCallEnd: null,
+        raw: { output: 'Hello world' },
+      });
     });
 
     test('should skip metadata chunks', () => {
       const chunk = '{"type":"metadata","data":"ignored"}';
       const result = client.parseN8nChunk(chunk);
 
-      expect(result).toEqual({ content: null, isEndOfTurn: false });
+      expect(result).toEqual({
+        content: null,
+        isEndOfTurn: false,
+        toolCallStart: null,
+        toolCallEnd: null,
+        raw: { type: 'metadata', data: 'ignored' },
+      });
     });
 
     test('should skip begin/error chunks without end-of-turn signal', () => {
       expect(client.parseN8nChunk('{"type":"begin"}')).toEqual({
         content: null,
         isEndOfTurn: false,
+        toolCallStart: null,
+        toolCallEnd: null,
+        raw: { type: 'begin' },
       });
       expect(client.parseN8nChunk('{"type":"error"}')).toEqual({
         content: null,
         isEndOfTurn: false,
+        toolCallStart: null,
+        toolCallEnd: null,
+        raw: { type: 'error' },
       });
     });
 
@@ -469,28 +798,277 @@ describe('N8nClient', () => {
       expect(client.parseN8nChunk('{"type":"end"}')).toEqual({
         content: null,
         isEndOfTurn: true,
+        toolCallStart: null,
+        toolCallEnd: null,
+        raw: { type: 'end' },
       });
       expect(client.parseN8nChunk('{"type":"end","metadata":{}}')).toEqual({
         content: null,
         isEndOfTurn: true,
+        toolCallStart: null,
+        toolCallEnd: null,
+        raw: { type: 'end', metadata: {} },
       });
     });
 
     test('should handle plain text', () => {
       const result = client.parseN8nChunk('plain text');
 
-      expect(result).toEqual({ content: 'plain text', isEndOfTurn: false });
+      expect(result).toEqual({
+        content: 'plain text',
+        isEndOfTurn: false,
+        toolCallStart: null,
+        toolCallEnd: null,
+        raw: null,
+      });
     });
 
     test('should return null content for empty input', () => {
-      expect(client.parseN8nChunk('')).toEqual({ content: null, isEndOfTurn: false });
-      expect(client.parseN8nChunk('   ')).toEqual({ content: null, isEndOfTurn: false });
+      expect(client.parseN8nChunk('')).toEqual({
+        content: null,
+        isEndOfTurn: false,
+        toolCallStart: null,
+        toolCallEnd: null,
+        raw: null,
+      });
+      expect(client.parseN8nChunk('   ')).toEqual({
+        content: null,
+        isEndOfTurn: false,
+        toolCallStart: null,
+        toolCallEnd: null,
+        raw: null,
+      });
     });
 
     test('should return null content for invalid JSON starting with brace', () => {
       const result = client.parseN8nChunk('{invalid json}');
 
-      expect(result).toEqual({ content: null, isEndOfTurn: false });
+      expect(result).toEqual({
+        content: null,
+        isEndOfTurn: false,
+        toolCallStart: null,
+        toolCallEnd: null,
+        raw: null,
+      });
+    });
+
+    test('should detect tool call start chunks', () => {
+      const result = client.parseN8nChunk(
+        '{"type":"tool_call","id":"call_wait_1","name":"wait_test_tool","arguments":{"delayMs":250}}',
+      );
+
+      expect(result).toEqual({
+        content: null,
+        isEndOfTurn: false,
+        toolCallStart: {
+          id: 'call_wait_1',
+          name: 'wait_test_tool',
+          args: { delayMs: 250 },
+        },
+        toolCallEnd: null,
+        raw: {
+          type: 'tool_call',
+          id: 'call_wait_1',
+          name: 'wait_test_tool',
+          arguments: { delayMs: 250 },
+        },
+      });
+    });
+
+    test('should detect tool call end chunks', () => {
+      const result = client.parseN8nChunk(
+        '{"type":"tool_result","output":"wait complete"}',
+      );
+
+      expect(result).toEqual({
+        content: null,
+        isEndOfTurn: false,
+        toolCallStart: null,
+        toolCallEnd: {
+          id: '',
+          output: 'wait complete',
+        },
+        raw: {
+          type: 'tool_result',
+          output: 'wait complete',
+        },
+      });
+    });
+
+    test('should detect tool call end chunks with tool call id', () => {
+      const result = client.parseN8nChunk(
+        '{"type":"tool_result","id":"call_wait_1","output":"wait complete"}',
+      );
+
+      expect(result).toEqual({
+        content: null,
+        isEndOfTurn: false,
+        toolCallStart: null,
+        toolCallEnd: {
+          id: 'call_wait_1',
+          output: 'wait complete',
+        },
+        raw: {
+          type: 'tool_result',
+          id: 'call_wait_1',
+          output: 'wait complete',
+        },
+      });
+    });
+
+    test('should preserve raw payload for synthetic tool-step detection candidates', () => {
+      const result = client.parseN8nChunk(
+        '{"toolName":"wait_test_tool","toolArgs":{"delayMs":250},"message":"Ik ga wachten."}',
+      );
+
+      expect(result).toEqual({
+        content: 'Ik ga wachten.',
+        isEndOfTurn: false,
+        toolCallStart: null,
+        toolCallEnd: null,
+        raw: {
+          toolName: 'wait_test_tool',
+          toolArgs: { delayMs: 250 },
+          message: 'Ik ga wachten.',
+        },
+      });
+    });
+  });
+
+  describe('synthetic early tool step emission', () => {
+    test('should synthesize a LibreChat run step before answer text from runtime tool metadata', async () => {
+      const mockResponse = {
+        data: {
+          runtime: {
+            toolName: 'wait_test_tool',
+            toolArgs: { delayMs: 3000 },
+          },
+          async *[Symbol.asyncIterator]() {
+            yield Buffer.from('{"message":"Ik ga nu wachten."}\n');
+          },
+        },
+      };
+
+      const chunks = [];
+      for await (const content of client.processResponseStream(mockResponse, { runId: 'resp-456' })) {
+        chunks.push(content);
+      }
+
+      expect(chunks[0]).toEqual({
+        kind: 'librechat_step_event',
+        payload: {
+          event: 'on_run_step',
+          data: {
+            id: 'step_synthetic_resp-456_wait_test_tool',
+            index: 0,
+            runId: 'resp-456',
+            status: 'in_progress',
+            stepDetails: {
+              type: 'tool_calls',
+              tool_calls: [
+                {
+                  id: 'synthetic_resp-456_wait_test_tool',
+                  type: 'tool_call',
+                  name: 'wait_test_tool',
+                  args: { delayMs: 3000 },
+                },
+              ],
+            },
+          },
+        },
+      });
+      expect(chunks[1]).toBe('Ik ga nu wachten.');
+      expect(chunks[2]).toEqual({
+        kind: 'librechat_step_event',
+        payload: {
+          event: 'on_run_step_completed',
+          data: {
+            result: {
+              id: 'step_synthetic_resp-456_wait_test_tool',
+              completed_at: expect.any(Number),
+              tool_call: {
+                id: 'synthetic_resp-456_wait_test_tool',
+                type: 'tool_call',
+                name: 'wait_test_tool',
+                args: { delayMs: 3000 },
+                output: '',
+                progress: 1,
+              },
+            },
+          },
+        },
+      });
+      expect(chunks[3]).toEqual({
+        kind: 'librechat_step_event',
+        payload: {
+          event: 'on_run_step_closed',
+          data: {
+            id: 'step_synthetic_resp-456_wait_test_tool',
+            status: 'completed',
+            completed_at: expect.any(Number),
+          },
+        },
+      });
+    });
+
+    test('should prefer runtime toolCallId when provided', async () => {
+      const mockResponse = {
+        data: {
+          runtime: {
+            toolCallId: 'runtime-call-123',
+            toolName: 'wait_test_tool',
+            toolArgs: { delayMs: 1500 },
+          },
+          async *[Symbol.asyncIterator]() {
+            yield Buffer.from('{"message":"Ik ga nu wachten."}\n');
+          },
+        },
+      };
+
+      const chunks = [];
+      for await (const content of client.processResponseStream(mockResponse, { runId: 'resp-789' })) {
+        chunks.push(content);
+      }
+
+      expect(chunks[0]).toEqual(
+        expect.objectContaining({
+          kind: 'librechat_step_event',
+          payload: expect.objectContaining({
+            event: 'on_run_step',
+            data: expect.objectContaining({
+              id: 'step_runtime-call-123',
+              runId: 'resp-789',
+              stepDetails: {
+                type: 'tool_calls',
+                tool_calls: [
+                  {
+                    id: 'runtime-call-123',
+                    type: 'tool_call',
+                    name: 'wait_test_tool',
+                    args: { delayMs: 1500 },
+                  },
+                ],
+              },
+            }),
+          }),
+        }),
+      );
+      expect(chunks[2]).toEqual(
+        expect.objectContaining({
+          kind: 'librechat_step_event',
+          payload: expect.objectContaining({
+            event: 'on_run_step_completed',
+            data: {
+              result: expect.objectContaining({
+                id: 'step_runtime-call-123',
+                tool_call: expect.objectContaining({
+                  id: 'runtime-call-123',
+                }),
+              }),
+            },
+          }),
+        }),
+      );
     });
   });
 });

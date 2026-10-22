@@ -21,6 +21,7 @@ const request = require('supertest');
 const chatCompletionsRoute = require('../../src/routes/chatCompletions');
 const Config = require('../../src/config/Config');
 const ModelRepository = require('../../src/repositories/ModelRepository');
+const { createLibreChatStepEventDecoder } = require('../../src/utils/libreChatEventProtocol');
 
 describe('chatCompletions route', () => {
   let app;
@@ -285,6 +286,63 @@ describe('chatCompletions route', () => {
         expect(response.text).toContain('data: [DONE]');
       });
 
+      it('should tunnel LibreChat step events through OpenAI-compatible content before normal text', async () => {
+        async function* mockStreamGenerator() {
+          yield {
+            kind: 'librechat_step_event',
+            payload: {
+              event: 'on_run_step',
+              data: {
+                id: 'step_call_wait_1',
+                index: 0,
+                runId: 'resp-123',
+                status: 'in_progress',
+                stepDetails: {
+                  type: 'tool_calls',
+                  tool_calls: [
+                    {
+                      id: 'call_wait_1',
+                      type: 'tool_call',
+                      name: 'wait_test_tool',
+                      args: { delayMs: 3000 },
+                    },
+                  ],
+                },
+              },
+            },
+          };
+          yield 'Ik ga nu wachten.';
+        }
+
+        mockN8nClient.streamCompletion.mockReturnValue(mockStreamGenerator());
+
+        const response = await request(app)
+          .post('/')
+          .send({
+            model: 'test-model',
+            messages: [{ role: 'user', content: 'Hello' }],
+            stream: true,
+            responseMessageId: 'resp-123',
+          });
+
+        expect(response.status).toBe(200);
+        const frames = response.text
+          .split('\n')
+          .filter((line) => line.startsWith('data: {'))
+          .map((line) => JSON.parse(line.slice('data: '.length)));
+        const decoder = createLibreChatStepEventDecoder();
+        expect(decoder.push(frames[0].choices[0].delta.content)).toEqual([
+          {
+            type: 'event',
+            event: expect.objectContaining({
+              event: 'on_run_step',
+              data: expect.objectContaining({ id: 'step_call_wait_1', runId: 'resp-123' }),
+            }),
+          },
+        ]);
+        expect(frames[1].choices[0].delta.content).toBe('Ik ga nu wachten.');
+      });
+
       it('should handle streaming error gracefully', async () => {
         async function* mockStreamGenerator() {
           yield 'Start';
@@ -327,6 +385,32 @@ describe('chatCompletions route', () => {
           [{ role: 'user', content: 'Hello' }],
           'session-789',
           expect.objectContaining({ userId: 'user-123' }),
+          { runId: 'session-789' },
+        );
+      });
+
+      it('should forward responseMessageId as runId in streaming mode', async () => {
+        async function* mockStreamGenerator() {
+          yield 'Response';
+        }
+
+        mockN8nClient.streamCompletion.mockReturnValue(mockStreamGenerator());
+
+        await request(app)
+          .post('/')
+          .send({
+            model: 'test-model',
+            messages: [{ role: 'user', content: 'Hello' }],
+            stream: true,
+            responseMessageId: 'resp-123',
+          });
+
+        expect(mockN8nClient.streamCompletion).toHaveBeenCalledWith(
+          'https://n8n.example.com/webhook/test',
+          [{ role: 'user', content: 'Hello' }],
+          expect.any(String),
+          expect.objectContaining({ userId: 'anonymous' }),
+          { runId: 'resp-123' },
         );
       });
     });
