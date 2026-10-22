@@ -2,6 +2,24 @@
 
 OpenAI-compatible API middleware for n8n workflows. Use your n8n agents and workflows as OpenAI models in any OpenAI-compatible client.
 
+## About this GovChat-NL fork
+
+This repository is maintained by [GovChat-NL](https://github.com/GovChat-NL) as a fork of the [upstream n8n OpenAI Bridge](https://github.com/sveneisenschmidt/n8n-openai-bridge). It keeps the bridge's OpenAI-compatible API while adding an integration tailored to GovChat-NL's LibreChat and n8n deployment.
+
+In the GovChat-NL deployment, the bridge sits between LibreChat and n8n: LibreChat sends an OpenAI-compatible request to the bridge, and the bridge calls the configured n8n webhook. Separately, the n8n AI Agent connects directly to LiteLLM for its model requests; that model connection does not pass through the bridge. As n8n streams the workflow response back through the webhook, the bridge observes the tool lifecycle events, translates them into LibreChat step events, and sends them in the response's Server-Sent Events (SSE) stream. This lets LibreChat show tools as **native tool-call cards**, including their arguments, in-progress state, and completion or error, rather than leaking tool-invocation logs into assistant text.
+
+```mermaid
+flowchart TB
+    LC[LibreChat] -->|OpenAI-compatible request| Bridge[n8n OpenAI Bridge]
+    Bridge -->|Webhook request| N8N[n8n AI Agent]
+    N8N -->|Direct model requests| LiteLLM[LiteLLM]
+    N8N -->|Streamed response and tool lifecycle events| Bridge
+    Bridge -->|OpenAI SSE with LCSTEP events| LC
+    Overlay[LibreChat runtime overlay] -. decodes events and updates native cards .-> LC
+```
+
+This live-tool-calling behavior is an **opt-in, coordinated integration**, not a feature of this bridge in isolation. It requires matching runtime overlays for LibreChat and n8n from [GovChat-NL-LibreChat](https://github.com/GovChat-NL/GovChat-NL-LibreChat), mounted into the corresponding official containers. No custom LibreChat or n8n image is required. Without the matching LibreChat overlay, the lifecycle events cannot be rendered as native LibreChat tool cards. The integration is designed for this coordinated stack; other OpenAI-compatible clients do not automatically interpret the LibreChat-specific sideband events.
+
 ![Demo](docs/pictures/demo.webp)
 
 ## Features
