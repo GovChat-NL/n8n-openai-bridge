@@ -20,6 +20,11 @@ const axios = require('axios');
 const FormData = require('form-data');
 const { StringDecoder } = require('string_decoder');
 const {
+  createRunStepEvent,
+  createRunStepCompletedEvent,
+  createRunStepClosedEvent,
+} = require('./utils/libreChatEvents');
+const {
   processMessages,
   filesToBuffers,
   extractTextFromMultimodal,
@@ -44,7 +49,7 @@ class N8nClient {
     return headers;
   }
 
-  buildPayload(messages, sessionId, userContext, streamId = null) {
+  buildPayload(messages, sessionId, userContext) {
     const fileUploadMode = this.config.fileUploadMode || 'passthrough';
 
     // Process messages according to file upload mode
@@ -93,10 +98,6 @@ class N8nClient {
       payload.userRole = userContext.userRole;
     }
 
-    if (streamId) {
-      payload.streamId = streamId;
-    }
-
     // Add task detection if enabled
     if (this.config.enableTaskDetection && this.taskDetectorService) {
       const taskDetection = this.taskDetectorService.detectTask(messages);
@@ -117,17 +118,214 @@ class N8nClient {
    * Shared method to eliminate duplication between streaming and non-streaming
    * @private
    */
-  async *processResponseStream(response) {
+  async *processResponseStream(response, options = {}) {
     let buffer = '';
     const decoder = new StringDecoder('utf8');
     let hasYieldedContent = false;
     let pendingTurnSeparator = false;
     const turnSeparator = this.config.agentTurnSeparator ?? '\n\n';
-    const filterToolCallLogText = createToolCallLogTextFilter(this.MAX_BUFFER_SIZE);
+    const runId = options.runId;
+    const requestId = options.requestId;
+    const activeToolSteps = new Map();
+    let nextToolStepIndex = 0;
+    let nextTextToolCallId = 0;
+    let firstTextChunkLogged = false;
+    let syntheticToolStepEmitted = false;
+    let metadataToolStepEmitted = false;
+    const filterToolCallText = createToolCallTextFilter(this.MAX_BUFFER_SIZE);
+
+    const runtimeToolCallStart = this.extractRuntimeToolCallStart(response, runId);
+    let rawChunkLogCount = 0;
+    let parsedChunkLogCount = 0;
+
+    const emitToolStepCompletion = (toolStep, output = '') => {
+      if (!toolStep) {
+        return [];
+      }
+
+      const completedAt = Date.now();
+      return [
+        {
+          kind: 'librechat_step_event',
+          payload: createRunStepCompletedEvent({
+            stepId: toolStep.stepId,
+            toolCallId: toolStep.toolCallId,
+            toolName: toolStep.toolName,
+            toolArgs: toolStep.toolArgs,
+            output,
+            completedAt,
+          }),
+        },
+        {
+          kind: 'librechat_step_event',
+          payload: createRunStepClosedEvent({
+            stepId: toolStep.stepId,
+            completedAt,
+          }),
+        },
+      ];
+    };
+
+    const emitToolStepStart = (toolCallStart, source = 'stream') => {
+      if (!toolCallStart || !runId) {
+        return null;
+      }
+
+      const stepId = `step_${toolCallStart.id}`;
+      const existingToolStep = activeToolSteps.get(toolCallStart.id);
+      if (existingToolStep) {
+        return null;
+      }
+
+      const toolStep = {
+        stepId,
+        toolCallId: toolCallStart.id,
+        toolName: toolCallStart.name,
+        toolArgs: toolCallStart.args,
+      };
+      activeToolSteps.set(toolCallStart.id, toolStep);
+      if (this.config.diagnosticLogging) {
+        console.log(
+          `[diag][bridge][${requestId || 'no-request-id'}] tool_start_detected source=${source} runId=${runId} toolCallId=${toolStep.toolCallId} toolName=${toolStep.toolName} activeToolSteps=${activeToolSteps.size}`,
+        );
+      }
+      return {
+        kind: 'librechat_step_event',
+        payload: createRunStepEvent({
+          stepId: toolStep.stepId,
+          runId,
+          toolCallId: toolStep.toolCallId,
+          toolName: toolStep.toolName,
+          toolArgs: toolStep.toolArgs,
+          index: nextToolStepIndex++,
+        }),
+      };
+    };
+
+    const maybeCreateSyntheticToolCallStart = (data) => {
+      if (
+        syntheticToolStepEmitted ||
+        !runId ||
+        !data ||
+        typeof data !== 'object' ||
+        Array.isArray(data) ||
+        data.type
+      ) {
+        return null;
+      }
+
+      const candidateName =
+        typeof data.toolName === 'string'
+          ? data.toolName
+          : typeof data.tool === 'string'
+            ? data.tool
+            : typeof data.name === 'string'
+              ? data.name
+              : '';
+
+      if (!candidateName) {
+        return null;
+      }
+
+      const candidateArgs = data.toolArgs ?? data.arguments ?? data.args ?? data.input ?? '';
+      const candidateId =
+        typeof data.toolCallId === 'string' && data.toolCallId
+          ? data.toolCallId
+          : `synthetic_${runId}_${candidateName.replace(/[^a-zA-Z0-9_-]/g, '_')}`;
+
+      syntheticToolStepEmitted = true;
+      return {
+        id: candidateId,
+        name: candidateName,
+        args: candidateArgs,
+      };
+    };
+
+    const maybeCreateMetadataToolCallStart = (data) => {
+      if (
+        metadataToolStepEmitted ||
+        syntheticToolStepEmitted ||
+        !runId ||
+        !data ||
+        typeof data !== 'object' ||
+        Array.isArray(data)
+      ) {
+        return null;
+      }
+
+      const metadata = data.metadata;
+      if (!metadata || typeof metadata !== 'object') {
+        return null;
+      }
+
+      const nodeName =
+        typeof metadata.nodeName === 'string'
+          ? metadata.nodeName
+          : typeof data.nodeName === 'string'
+            ? data.nodeName
+            : '';
+      const nodeId =
+        typeof metadata.nodeId === 'string'
+          ? metadata.nodeId
+          : typeof data.nodeId === 'string'
+            ? data.nodeId
+            : '';
+      const type = typeof data.type === 'string' ? data.type : '';
+
+      if (!nodeName || !nodeId || !type) {
+        return null;
+      }
+
+      const normalizedNodeName = nodeName.trim();
+      const looksLikeToolNode =
+        normalizedNodeName !== 'AI Agent Orchestrator' &&
+        (normalizedNodeName.endsWith('_tool') || normalizedNodeName.includes('tool'));
+
+      if (!looksLikeToolNode) {
+        return null;
+      }
+
+      if (type !== 'begin' && type !== 'item' && type !== 'error') {
+        return null;
+      }
+
+      metadataToolStepEmitted = true;
+      syntheticToolStepEmitted = true;
+      return {
+        id: `metadata_${runId}_${nodeId}`,
+        name: normalizedNodeName,
+        args: '',
+      };
+    };
+
+    if (this.config.diagnosticLogging) {
+      const runtimeEnvelope = response?.data?.runtime;
+      console.log(
+        `[diag][bridge][${requestId || 'no-request-id'}] response_runtime_envelope runId=${runId} payload=${JSON.stringify(runtimeEnvelope ?? null).slice(0, 1000)}`,
+      );
+    }
+
+    const runtimeStepStartEvent = emitToolStepStart(runtimeToolCallStart, 'response-runtime');
+    if (runtimeStepStartEvent) {
+      syntheticToolStepEmitted = true;
+      yield runtimeStepStartEvent;
+      if (this.config.diagnosticLogging) {
+        console.log(
+          `[diag][bridge][${requestId || 'no-request-id'}] run_step_emitted runId=${runId} stepId=${runtimeStepStartEvent.payload.data.id} toolCallId=${runtimeStepStartEvent.payload.data.stepDetails.tool_calls[0].id}`,
+        );
+      }
+    }
 
     for await (const chunk of response.data) {
       const text = decoder.write(chunk);
       buffer += text;
+
+      if (this.config.diagnosticLogging && rawChunkLogCount < 12) {
+        rawChunkLogCount += 1;
+        console.log(
+          `[diag][bridge][${requestId || 'no-request-id'}] raw_stream_chunk#${rawChunkLogCount} runId=${runId} preview=${JSON.stringify(String(text).slice(0, 500))}`,
+        );
+      }
 
       // Check buffer size to prevent memory exhaustion
       if (buffer.length > this.MAX_BUFFER_SIZE) {
@@ -140,9 +338,101 @@ class N8nClient {
         buffer = chunks.remainder;
 
         for (const jsonChunk of chunks.extracted) {
-          const { content: parsedContent, isEndOfTurn } = this.parseN8nChunk(jsonChunk);
-          const content =
-            typeof parsedContent === 'string' ? filterToolCallLogText(parsedContent) : parsedContent;
+          let parsed = this.parseN8nChunk(jsonChunk);
+          if (this.config.diagnosticLogging && parsedChunkLogCount < 20) {
+            parsedChunkLogCount += 1;
+            console.log(
+              `[diag][bridge][${requestId || 'no-request-id'}] parsed_chunk#${parsedChunkLogCount} runId=${runId} raw=${JSON.stringify(parsed.raw).slice(0, 1200)} content=${JSON.stringify(parsed.content)} toolCallStart=${JSON.stringify(parsed.toolCallStart)} toolCallEnd=${JSON.stringify(parsed.toolCallEnd)} isEndOfTurn=${parsed.isEndOfTurn}`,
+            );
+          }
+          const syntheticToolCallStart = maybeCreateSyntheticToolCallStart(parsed.raw);
+          const metadataToolCallStart = maybeCreateMetadataToolCallStart(parsed.raw);
+          if ((syntheticToolCallStart || metadataToolCallStart) && !parsed.toolCallStart) {
+            parsed = {
+              ...parsed,
+              toolCallStart: syntheticToolCallStart || metadataToolCallStart,
+            };
+          }
+
+          let content = parsed.content;
+          let toolCallStart = parsed.toolCallStart;
+          const { isEndOfTurn, toolCallEnd } = parsed;
+          const filteredText = filterToolCallText(content);
+          content = filteredText.text;
+
+          const stepStartEvent = emitToolStepStart(
+            toolCallStart,
+            syntheticToolCallStart
+              ? 'synthetic-runtime'
+              : metadataToolCallStart
+                ? 'metadata-node'
+                : 'stream',
+          );
+          if (stepStartEvent) {
+            yield stepStartEvent;
+            if (this.config.diagnosticLogging) {
+              console.log(
+                `[diag][bridge][${requestId || 'no-request-id'}] run_step_emitted runId=${runId} stepId=${stepStartEvent.payload.data.id} toolCallId=${stepStartEvent.payload.data.stepDetails.tool_calls[0].id}`,
+              );
+            }
+          }
+
+          for (const candidate of filteredText.toolCalls) {
+            const contentToolCallStart = {
+              id:
+                candidate.id ||
+                candidate.toolCallId ||
+                `text_${runId || 'run'}_${nextTextToolCallId++}`,
+              name: candidate.name || candidate.tool,
+              args: candidate.arguments ?? candidate.args ?? candidate.input ?? '',
+            };
+            const contentStepStartEvent = emitToolStepStart(contentToolCallStart, 'content-tool-call');
+            if (contentStepStartEvent) {
+              yield contentStepStartEvent;
+            }
+          }
+
+          const metadataNodeId =
+            parsed.raw && parsed.raw.metadata && typeof parsed.raw.metadata.nodeId === 'string'
+              ? parsed.raw.metadata.nodeId
+              : '';
+          const metadataToolCallId = metadataNodeId ? `metadata_${runId}_${metadataNodeId}` : '';
+          const metadataToolStep = metadataToolCallId ? activeToolSteps.get(metadataToolCallId) : null;
+          const metadataToolShouldComplete =
+            metadataToolStep &&
+            ((parsed.raw && parsed.raw.type === 'error') ||
+              (parsed.raw && parsed.raw.type === 'end' && parsed.raw.metadata?.nodeName !== 'AI Agent Orchestrator'));
+
+          if (toolCallEnd || metadataToolShouldComplete) {
+            const completedToolStep =
+              (toolCallEnd && toolCallEnd.id && activeToolSteps.get(toolCallEnd.id)) ||
+              (toolCallEnd && toolCallEnd.name
+                ? [...activeToolSteps.values()].find((step) => step.toolName === toolCallEnd.name)
+                : null) ||
+              metadataToolStep ||
+              (activeToolSteps.size === 1 ? activeToolSteps.values().next().value : null);
+
+            if (completedToolStep) {
+              if (this.config.diagnosticLogging) {
+                const matchedBy =
+                  toolCallEnd.id && activeToolSteps.has(toolCallEnd.id)
+                    ? 'id'
+                    : toolCallEnd.name
+                      ? 'tool-name'
+                      : 'single-active-fallback';
+                console.log(
+                  `[diag][bridge][${requestId || 'no-request-id'}] tool_end_detected runId=${runId} toolCallId=${completedToolStep.toolCallId} matchedBy=${matchedBy}`,
+                );
+              }
+              const completionOutput = toolCallEnd?.error
+                ? `Tool failed: ${toolCallEnd.error}`
+                : toolCallEnd?.output || '';
+              for (const event of emitToolStepCompletion(completedToolStep, completionOutput)) {
+                yield event;
+              }
+              activeToolSteps.delete(completedToolStep.toolCallId);
+            }
+          }
 
           // Track agent turn boundaries to inject separators
           if (isEndOfTurn && hasYieldedContent) {
@@ -150,6 +440,12 @@ class N8nClient {
           }
 
           if (content) {
+            if (!firstTextChunkLogged && this.config.diagnosticLogging) {
+              firstTextChunkLogged = true;
+              console.log(
+                `[diag][bridge][${requestId || 'no-request-id'}] first_text_chunk runId=${runId} preview=${JSON.stringify(String(content).slice(0, 120))}`,
+              );
+            }
             if (pendingTurnSeparator) {
               if (turnSeparator) {
                 yield turnSeparator;
@@ -168,24 +464,93 @@ class N8nClient {
 
     // Process remaining buffer
     if (buffer.trim()) {
-      const { content: parsedContent } = this.parseN8nChunk(buffer.trim());
-      const content =
-        typeof parsedContent === 'string' ? filterToolCallLogText(parsedContent) : parsedContent;
-      if (content) {
+      const parsed = this.parseN8nChunk(buffer.trim());
+      if (this.config.diagnosticLogging) {
+        console.log(
+          `[diag][bridge][${requestId || 'no-request-id'}] trailing_buffer_parsed runId=${runId} raw=${JSON.stringify(parsed.raw).slice(0, 1200)} content=${JSON.stringify(parsed.content)} toolCallStart=${JSON.stringify(parsed.toolCallStart)} toolCallEnd=${JSON.stringify(parsed.toolCallEnd)}`,
+        );
+      }
+      const syntheticToolCallStart = maybeCreateSyntheticToolCallStart(parsed.raw);
+      const metadataToolCallStart = maybeCreateMetadataToolCallStart(parsed.raw);
+      const stepStartEvent = emitToolStepStart(
+        parsed.toolCallStart || syntheticToolCallStart || metadataToolCallStart,
+        syntheticToolCallStart
+          ? 'synthetic-runtime'
+          : metadataToolCallStart
+            ? 'metadata-node'
+            : 'stream',
+      );
+      if (stepStartEvent) {
+        yield stepStartEvent;
+      }
+      if (parsed.toolCallEnd) {
+        const completedToolStep =
+          (parsed.toolCallEnd.id && activeToolSteps.get(parsed.toolCallEnd.id)) ||
+          (parsed.toolCallEnd.name
+            ? [...activeToolSteps.values()].find((step) => step.toolName === parsed.toolCallEnd.name)
+            : null) ||
+          (activeToolSteps.size === 1 ? activeToolSteps.values().next().value : null);
+        if (completedToolStep) {
+          const completionOutput = parsed.toolCallEnd.error
+            ? `Tool failed: ${parsed.toolCallEnd.error}`
+            : parsed.toolCallEnd.output || '';
+          for (const event of emitToolStepCompletion(completedToolStep, completionOutput)) {
+            yield event;
+          }
+          activeToolSteps.delete(completedToolStep.toolCallId);
+        }
+      }
+      const filteredText = filterToolCallText(parsed.content);
+      for (const candidate of filteredText.toolCalls) {
+        const stepStartEvent = emitToolStepStart(
+          {
+            id: candidate.id || candidate.toolCallId || `text_${runId || 'run'}_${nextTextToolCallId++}`,
+            name: candidate.name || candidate.tool,
+            args: candidate.arguments ?? candidate.args ?? candidate.input ?? '',
+          },
+          'content-tool-call',
+        );
+        if (stepStartEvent) {
+          yield stepStartEvent;
+        }
+      }
+      if (filteredText.text) {
         if (pendingTurnSeparator && turnSeparator) {
           yield turnSeparator;
         }
-        yield content;
+        yield filteredText.text;
       }
     }
 
-    const remainingContent = filterToolCallLogText('', true);
-    if (remainingContent) {
-      if (pendingTurnSeparator && turnSeparator) {
-        yield turnSeparator;
-      }
-      yield remainingContent;
+    const remainingText = filterToolCallText('', true);
+    if (remainingText.text) {
+      yield remainingText.text;
     }
+    for (const candidate of remainingText.toolCalls) {
+      const stepStartEvent = emitToolStepStart(
+        {
+          id: candidate.id || candidate.toolCallId || `text_${runId || 'run'}_${nextTextToolCallId++}`,
+          name: candidate.name || candidate.tool,
+          args: candidate.arguments ?? candidate.args ?? candidate.input ?? '',
+        },
+        'content-tool-call',
+      );
+      if (stepStartEvent) {
+        yield stepStartEvent;
+      }
+    }
+
+    for (const danglingToolStep of activeToolSteps.values()) {
+      if (this.config.diagnosticLogging) {
+        console.log(
+          `[diag][bridge][${requestId || 'no-request-id'}] synthetic_tool_end_on_stream_close runId=${runId} toolCallId=${danglingToolStep.toolCallId}`,
+        );
+      }
+      for (const event of emitToolStepCompletion(danglingToolStep, '')) {
+        yield event;
+      }
+    }
+    activeToolSteps.clear();
   }
 
   /**
@@ -240,8 +605,8 @@ class N8nClient {
     };
   }
 
-  async *streamCompletion(webhookUrl, messages, sessionId, userContext, streamId = null) {
-    const payload = this.buildPayload(messages, sessionId, userContext, streamId);
+  async *streamCompletion(webhookUrl, messages, sessionId, userContext, options = {}) {
+    const payload = this.buildPayload(messages, sessionId, userContext);
     const files = this._pendingFiles || [];
     this._pendingFiles = [];
 
@@ -254,7 +619,7 @@ class N8nClient {
       });
 
       // Use the shared stream processing method
-      yield* this.processResponseStream(response);
+      yield* this.processResponseStream(response, options);
     } catch (error) {
       console.error('Streaming error:', error.message);
       throw error;
@@ -349,38 +714,259 @@ class N8nClient {
     return { extracted, remainder };
   }
 
+  normalizeEmbeddedToolCallChunk(data) {
+    if (!data || typeof data !== 'object' || Array.isArray(data)) {
+      return data;
+    }
+
+    const hasToolCallIdentity =
+      (typeof data.name === 'string' || typeof data.tool === 'string') &&
+      (typeof data.id === 'string' || typeof data.toolCallId === 'string');
+    const isDirectToolCall =
+      (data.type === 'tool_call' || data.type === 'tool_start') && hasToolCallIdentity;
+    const isDirectToolResult =
+      (data.type === 'tool_result' || data.type === 'tool_end' || data.type === 'tool_error') &&
+      (typeof data.id === 'string' || typeof data.toolCallId === 'string') &&
+      (data.output !== undefined || data.error !== undefined);
+    if (isDirectToolCall || isDirectToolResult) {
+      return data;
+    }
+
+    const content =
+      typeof data.content === 'string'
+        ? data.content.trim()
+        : typeof data.message === 'string'
+          ? data.message.trim()
+          : '';
+
+    if (!content || content[0] !== '{') {
+      return data;
+    }
+
+    try {
+      const embedded = JSON.parse(content);
+      const embeddedType = embedded?.type;
+      const embeddedToolCall =
+        (embeddedType === 'tool_call' || embeddedType === 'tool_start') &&
+        typeof (embedded.name || embedded.tool) === 'string' &&
+        (typeof embedded.id === 'string' || typeof embedded.toolCallId === 'string');
+      const embeddedToolResult =
+        (embeddedType === 'tool_result' || embeddedType === 'tool_end' || embeddedType === 'tool_error') &&
+        (typeof embedded.id === 'string' || typeof embedded.toolCallId === 'string');
+
+      if (embedded && typeof embedded === 'object' && !Array.isArray(embedded) && (embeddedToolCall || embeddedToolResult)) {
+        return {
+          ...data,
+          ...embedded,
+          type: embeddedType,
+          content: embedded.content,
+          arguments: embedded.arguments ?? embedded.args ?? embedded.input,
+          __embeddedToolCallSource: data,
+        };
+      }
+    } catch {
+      return data;
+    }
+
+    return data;
+  }
+
   /**
    * Parse an n8n response chunk and extract content and turn boundary info.
    * Handles JSON chunks with various content fields (content, text, output, message)
    * and detects agent turn boundaries (type: "end") in a single parse.
    * @param {string} chunkText - Raw chunk text (JSON or plain text)
-   * @returns {{ content: string|null, isEndOfTurn: boolean }} Parsed result
+   * @returns {{ content: string|null, isEndOfTurn: boolean, toolCallStart: object|null, toolCallEnd: object|null, raw: object|null }} Parsed result
    */
   parseN8nChunk(chunkText) {
     if (!chunkText || !chunkText.trim()) {
-      return { content: null, isEndOfTurn: false };
+      return { content: null, isEndOfTurn: false, toolCallStart: null, toolCallEnd: null, raw: null };
     }
 
     try {
       const data = JSON.parse(chunkText);
+      const normalizedData = this.normalizeEmbeddedToolCallChunk(data);
 
-      const isEndOfTurn = data.type === 'end';
+      const isEndOfTurn = normalizedData.type === 'end';
+      const toolCallStart = this.extractToolCallStart(normalizedData);
+      const toolCallEnd = this.extractToolCallEnd(normalizedData);
 
       // Skip metadata chunks (but still report turn boundaries)
-      if (data.type && N8nClient.METADATA_TYPES.has(data.type)) {
-        return { content: null, isEndOfTurn };
+      if (normalizedData.type && N8nClient.METADATA_TYPES.has(normalizedData.type)) {
+        return { content: null, isEndOfTurn, toolCallStart, toolCallEnd, raw: normalizedData };
       }
 
-      // Extract content from common fields
-      const content = data.content || data.text || data.output || data.message || null;
-      return { content, isEndOfTurn };
+      // Tool-result payloads are lifecycle data, not assistant prose. Keeping
+      // their output out of `content` prevents it leaking after the completion
+      // event has already populated LibreChat's native tool-call card.
+      const content = toolCallEnd || toolCallStart
+        ? null
+        : normalizedData.content || normalizedData.text || normalizedData.output || normalizedData.message || null;
+      return { content, isEndOfTurn, toolCallStart, toolCallEnd, raw: normalizedData };
     } catch {
       // Not JSON, return as plain text
       const stripped = chunkText.trim();
       const content = stripped.startsWith('{') ? null : stripped;
-      return { content, isEndOfTurn: false };
+      return { content, isEndOfTurn: false, toolCallStart: null, toolCallEnd: null, raw: null };
     }
   }
+
+  extractToolCallStart(data) {
+    if (!data || typeof data !== 'object') {
+      return null;
+    }
+
+    const type = typeof data.type === 'string' ? data.type : '';
+    const name = typeof data.name === 'string' ? data.name : typeof data.tool === 'string' ? data.tool : '';
+    const id = typeof data.id === 'string' ? data.id : typeof data.toolCallId === 'string' ? data.toolCallId : '';
+    const args = data.arguments ?? data.args ?? data.input ?? '';
+
+    if ((type === 'tool_call' || type === 'tool_start') && name && id) {
+      return { id, name, args };
+    }
+
+    return null;
+  }
+
+  extractToolCallEnd(data) {
+    if (!data || typeof data !== 'object') {
+      return null;
+    }
+
+    const type = typeof data.type === 'string' ? data.type : '';
+    if (type !== 'tool_result' && type !== 'tool_end' && type !== 'tool_error') {
+      return null;
+    }
+
+    const output = Array.isArray(data.output) && data.output.length === 0
+      ? ''
+      : typeof data.output === 'string'
+        ? data.output
+        : data.output !== undefined
+          ? JSON.stringify(data.output)
+          : typeof data.content === 'string'
+            ? data.content
+            : typeof data.message === 'string'
+              ? data.message
+              : '';
+
+    return {
+      id:
+        typeof data.id === 'string'
+          ? data.id
+          : typeof data.toolCallId === 'string'
+            ? data.toolCallId
+            : '',
+      name: typeof data.name === 'string' ? data.name : typeof data.tool === 'string' ? data.tool : '',
+      error:
+        typeof data.error === 'string'
+          ? data.error
+          : data.error && typeof data.error.message === 'string'
+            ? data.error.message
+            : typeof data.message === 'string' && type === 'tool_error'
+              ? data.message
+              : '',
+      output,
+    };
+  }
+
+  extractRuntimeToolCallStart(response, runId = '') {
+    const runtime = response?.data?.runtime;
+    if (!runtime || typeof runtime !== 'object') {
+      return null;
+    }
+
+    const candidateName =
+      typeof runtime.toolName === 'string'
+        ? runtime.toolName
+        : typeof runtime.tool === 'string'
+          ? runtime.tool
+          : typeof runtime.name === 'string'
+            ? runtime.name
+            : '';
+
+    if (!candidateName) {
+      return null;
+    }
+
+    const candidateArgs = runtime.toolArgs ?? runtime.arguments ?? runtime.args ?? runtime.input ?? '';
+    const candidateId =
+      typeof runtime.toolCallId === 'string' && runtime.toolCallId
+        ? runtime.toolCallId
+        : buildSyntheticToolCallId(runId, response?.data?.runtimeRunId, response?.data?.runId, candidateName);
+
+    return {
+      id: candidateId,
+      name: candidateName,
+      args: candidateArgs,
+    };
+  }
+}
+
+function createToolCallTextFilter(maxBufferSize) {
+  const stripToolCallLogText = createToolCallLogTextFilter(maxBufferSize);
+  const stripToolCallJson = createEmbeddedToolCallJsonFilter(maxBufferSize);
+
+  return (content = '', flush = false) =>
+    stripToolCallJson(stripToolCallLogText(content, flush), flush);
+}
+
+function createEmbeddedToolCallJsonFilter(maxBufferSize) {
+  let pending = '';
+
+  return (content = '', flush = false) => {
+    let input = pending + (typeof content === 'string' ? content : '');
+    pending = '';
+    let text = '';
+    const toolCalls = [];
+
+    while (input) {
+      const start = input.indexOf('{');
+      if (start < 0) {
+        text += input;
+        break;
+      }
+      text += input.slice(0, start);
+
+      const end = findJsonObjectEnd(input, start);
+      if (end < 0) {
+        if (flush) {
+          text += input.slice(start);
+        } else {
+          pending = input.slice(start);
+          if (pending.length > maxBufferSize) {
+            throw new Error(`Incomplete tool-call text exceeded maximum size of ${maxBufferSize} bytes`);
+          }
+        }
+        break;
+      }
+
+      const json = input.slice(start, end + 1);
+      input = input.slice(end + 1);
+      let candidate;
+      try {
+        candidate = JSON.parse(json);
+      } catch {
+        text += json;
+        continue;
+      }
+
+      const isToolCall =
+        candidate &&
+        typeof candidate === 'object' &&
+        !Array.isArray(candidate) &&
+        (candidate.type === 'tool_call' || candidate.type === 'tool_start') &&
+        typeof (candidate.name || candidate.tool) === 'string' &&
+        (typeof candidate.id === 'string' || typeof candidate.toolCallId === 'string');
+      if (isToolCall) {
+        toolCalls.push(candidate);
+      } else {
+        text += json;
+      }
+    }
+
+    return { text, toolCalls };
+  };
 }
 
 function createToolCallLogTextFilter(maxBufferSize) {
@@ -419,9 +1005,9 @@ function createToolCallLogTextFilter(maxBufferSize) {
         const candidate = input.slice(markerIndex);
         if (!flush && candidate.length <= maxBufferSize) {
           pending = candidate;
-        } else {
-          text += candidate;
+          break;
         }
+        text += candidate;
         break;
       }
 
@@ -499,6 +1085,19 @@ function findJsonObjectEnd(text, start) {
   }
 
   return -1;
+}
+
+function buildSyntheticToolCallId(runId, runtimeRunId, responseRunId, candidateName) {
+  const baseId =
+    typeof runId === 'string' && runId
+      ? runId
+      : typeof runtimeRunId === 'string' && runtimeRunId
+        ? runtimeRunId
+        : typeof responseRunId === 'string' && responseRunId
+          ? responseRunId
+          : 'runtime';
+
+  return `synthetic_${baseId}_${candidateName.replace(/[^a-zA-Z0-9_-]/g, '_')}`;
 }
 
 module.exports = N8nClient;

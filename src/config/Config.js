@@ -57,13 +57,6 @@ class Config {
     this.serverKeepAliveTimeout = this.parseTimeout('SERVER_KEEP_ALIVE_TIMEOUT', 120000);
     this.serverHeadersTimeout = this.parseTimeout('SERVER_HEADERS_TIMEOUT', 121000);
 
-    // OpenAI-compatible tool-call proxy configuration
-    this.openaiToolProxyBaseUrl = this.parseUrl('OPENAI_TOOL_PROXY_BASE_URL');
-    this.openaiToolProxyApiKey = process.env.OPENAI_TOOL_PROXY_API_KEY || '';
-    this.openaiToolProxyTimeout = this.parseTimeout('OPENAI_TOOL_PROXY_TIMEOUT_MS', 120000);
-    this.activeStreamTtlMs = this.parseTimeout('ACTIVE_STREAM_TTL_MS', 600000);
-    this.activeStreamSweepIntervalMs = this.parseTimeout('ACTIVE_STREAM_SWEEP_INTERVAL_MS', 60000);
-
     // Validate headers timeout > keep-alive timeout
     if (this.serverHeadersTimeout <= this.serverKeepAliveTimeout) {
       console.warn(
@@ -79,6 +72,9 @@ class Config {
     const sep = process.env.AGENT_TURN_SEPARATOR;
     this.agentTurnSeparator =
       sep === undefined ? '\n\n' : sep.replace(/\\n/g, '\n').replace(/\\t/g, '\t');
+
+    // Diagnostic logging configuration
+    this.diagnosticLogging = process.env.DIAGNOSTIC_LOGGING === 'true';
   }
 
   /**
@@ -216,31 +212,6 @@ class Config {
     }
 
     return parsed;
-  }
-
-  /**
-   * Parse an optional absolute HTTP(S) URL without a trailing slash.
-   * @param {string} envVarName - Name of the environment variable
-   * @returns {string} The normalized URL or an empty string when not configured
-   */
-  parseUrl(envVarName) {
-    const value = process.env[envVarName];
-    if (!value || !value.trim()) {
-      return '';
-    }
-
-    try {
-      const url = new URL(value.trim());
-      if (!['http:', 'https:'].includes(url.protocol)) {
-        throw new Error('unsupported protocol');
-      }
-      return url.toString().replace(/\/$/, '');
-    } catch {
-      console.warn(
-        `${envVarName} must be an absolute HTTP(S) URL. OpenAI-compatible tool proxy is disabled.`,
-      );
-      return '';
-    }
   }
 }
 
