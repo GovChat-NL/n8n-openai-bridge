@@ -9,7 +9,7 @@ This repository is maintained by [GovChat-NL](https://github.com/GovChat-NL) as 
 In the GovChat-NL deployment, the bridge sits between LibreChat and n8n: LibreChat sends an OpenAI-compatible request to the bridge, and the bridge calls the configured n8n webhook. Separately, the n8n AI Agent connects directly to LiteLLM for its model requests; that model connection does not pass through the bridge. As n8n streams the workflow response back through the webhook, the bridge observes the tool lifecycle events, translates them into LibreChat step events, and sends them in the response's Server-Sent Events (SSE) stream. This lets LibreChat show tools as **native tool-call cards**, including their arguments, in-progress state, and completion or error, rather than leaking tool-invocation logs into assistant text.
 
 ```mermaid
-flowchart LR
+flowchart TB
     LC[LibreChat] -->|OpenAI-compatible request| Bridge[n8n OpenAI Bridge]
     Bridge -->|Webhook request| N8N[n8n AI Agent]
     N8N -->|Direct model requests| LiteLLM[LiteLLM]
