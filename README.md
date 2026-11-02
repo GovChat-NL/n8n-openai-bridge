@@ -18,7 +18,7 @@ flowchart TB
     Overlay[LibreChat runtime overlay] -. decodes events and updates native cards .-> LC
 ```
 
-This live-tool-calling behavior is an **opt-in, coordinated integration**, not a feature of this bridge in isolation. It requires matching runtime overlays for LibreChat and n8n from [GovChat-NL-LibreChat](https://github.com/GovChat-NL/GovChat-NL-LibreChat), mounted into the corresponding official containers. No custom LibreChat or n8n image is required. Without the matching LibreChat overlay, the lifecycle events cannot be rendered as native LibreChat tool cards. The integration is designed for this coordinated stack; other OpenAI-compatible clients do not automatically interpret the LibreChat-specific sideband events.
+This live-tool-calling behavior is an **opt-in, coordinated integration**, not a feature of this bridge in isolation. It requires matching runtime overlays for LibreChat and n8n from the [current GovChat-NL repository](https://github.com/GovChat-NL/GovChat-NL), mounted into the corresponding official containers. No custom LibreChat or n8n image is required. Without the matching LibreChat overlay, the lifecycle events cannot be rendered as native LibreChat tool cards. The integration is designed for this coordinated stack; other OpenAI-compatible clients do not automatically interpret the LibreChat-specific sideband events.
 
 ![Demo](docs/pictures/demo.webp)
 
