@@ -178,6 +178,7 @@ function createEntraIdentity(settings, fetchKeys = globalThis.fetch) {
     sanitizeIdentity(req.body, settings.header);
     let identity = deniedIdentity;
     if (settings.enabled && token !== undefined) {
+      let rejection = 'token_format';
       try {
         if (typeof token !== 'string' || token.length > 32768) {
           throw new Error('Invalid JWT');
@@ -189,6 +190,7 @@ function createEntraIdentity(settings, fetchKeys = globalThis.fetch) {
         const header = JSON.parse(decodeSegment(parts[0]).toString('utf8'));
         const claims = JSON.parse(decodeSegment(parts[1]).toString('utf8'));
         const signature = decodeSegment(parts[2]);
+        rejection = 'token_header';
         if (
           !header ||
           header.alg !== 'RS256' ||
@@ -200,6 +202,15 @@ function createEntraIdentity(settings, fetchKeys = globalThis.fetch) {
           throw new Error('Invalid JWT header');
         }
         const now = Math.floor(Date.now() / 1000);
+        const expectedClaims = {
+          token_version: claims?.ver === '2.0',
+          tenant: claims?.tid === settings.tenant,
+          issuer: claims?.iss === settings.issuer,
+          audience: claims?.aud === settings.audience,
+          caller: claims?.azp === settings.client,
+          scope: typeof claims?.scp === 'string' && claims.scp.split(' ').includes(settings.scope),
+        };
+        rejection = Object.keys(expectedClaims).filter((name) => !expectedClaims[name]).join(',') || 'user_or_lifetime';
         if (
           !claims ||
           claims.ver !== '2.0' ||
@@ -224,7 +235,9 @@ function createEntraIdentity(settings, fetchKeys = globalThis.fetch) {
         ) {
           throw new Error('Invalid delegated claims');
         }
+        rejection = 'signing_key';
         const key = await getKey(header.kid);
+        rejection = 'signature_or_expiry';
         if (
           !verify('RSA-SHA256', Buffer.from(`${parts[0]}.${parts[1]}`), key, signature) ||
           claims.exp <= Math.floor(Date.now() / 1000)
@@ -249,6 +262,8 @@ function createEntraIdentity(settings, fetchKeys = globalThis.fetch) {
           user_token_expires_at: claims.exp,
         });
       } catch {
+        // Fixed category names only: never log token bytes, claims, identities or groups.
+        console.warn(`[entra] Access token rejected: ${rejection}`);
         return sendError(res, 401, 'Invalid Entra access token', 'authentication_error');
       }
     }
