@@ -17,6 +17,7 @@
  */
 
 require('dotenv').config();
+const { readEntraConfig } = require('../middleware/entraIdentity');
 
 /**
  * Config - Pure Configuration Class
@@ -38,6 +39,7 @@ class Config {
     this.port = process.env.PORT || 3333;
     this.bearerToken = process.env.BEARER_TOKEN || '';
     this.n8nWebhookBearerToken = this.resolveN8nWebhookBearerToken();
+    this.entra = readEntraConfig();
     this.logRequests = process.env.LOG_REQUESTS === 'true';
     this.requestBodyLimit = process.env.REQUEST_BODY_LIMIT || '50mb';
 

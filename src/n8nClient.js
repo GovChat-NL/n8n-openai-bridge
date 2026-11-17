@@ -19,6 +19,7 @@
 const axios = require('axios');
 const FormData = require('form-data');
 const { StringDecoder } = require('string_decoder');
+const { identityContext, deniedIdentity, sanitizeIdentity } = require('./middleware/entraIdentity');
 const {
   createRunStepEvent,
   createRunStepCompletedEvent,
@@ -50,6 +51,7 @@ class N8nClient {
   }
 
   buildPayload(messages, sessionId, userContext) {
+    sanitizeIdentity(messages, this.config.entra?.header);
     const fileUploadMode = this.config.fileUploadMode || 'passthrough';
 
     // Process messages according to file upload mode
@@ -110,7 +112,7 @@ class N8nClient {
     // Store files for multipart mode (used by request methods)
     this._pendingFiles = fileUploadMode === 'extract-multipart' ? files : [];
 
-    return payload;
+    return { ...payload, ...(userContext[identityContext] || deniedIdentity) };
   }
 
   /**

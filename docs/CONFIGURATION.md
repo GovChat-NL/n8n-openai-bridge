@@ -56,6 +56,22 @@ BEARER_TOKEN=your-api-key        # Required: Auth token for API requests TO this
 N8N_WEBHOOK_BEARER_TOKEN=        # Optional: Auth token for n8n webhook nodes
 ```
 
+#### Optional delegated Entra identity
+
+Verification is disabled by default. Enabling it requires non-placeholder inbound `BEARER_TOKEN` and outgoing `N8N_WEBHOOK_BEARER_TOKEN`, plus all required Entra settings below; invalid configuration prevents startup. The private LibreChat backend must authenticate with the bridge bearer and send the user's **API delegated access token**, not an ID token, Graph token or LibreChat session token, in the configured header. The API and login application may share an ID, but the bare delegated scope remains mandatory. Only RS256, the exact single-tenant v2 issuer/audience, allowed `azp`, valid time/user claims and Microsoft's fixed tenant JWKS endpoint are accepted. Keys cache for one hour, refresh attempts have a 30-second cooldown and a 5-second fetch deadline; no JWKS URL override is supported.
+
+| Setting | Default / requirement |
+|---------|-----------------------|
+| `ENTRA_JWT_ENABLED` | `false`; explicitly `true` to enable |
+| `ENTRA_TENANT_ID` | Required tenant GUID |
+| `ENTRA_EXPECTED_AUDIENCE` | Required API application GUID (not `api://…`) |
+| `ENTRA_EXPECTED_ISSUER` | Optional; must equal `https://login.microsoftonline.com/<tenant>/v2.0` |
+| `ENTRA_ACCESS_TOKEN_HEADER` | `X-Entra-Access-Token`; an `X-…` header name |
+| `ENTRA_REQUIRED_SCOPE` | Required bare delegated scope name, e.g. `access_as_user` |
+| `ENTRA_ALLOWED_CLIENT_ID` | Required calling application GUID |
+
+Invalid provided tokens (including unavailable/unusable signing keys) return a generic 401 before any n8n call, without logging credentials or provider errors. Missing tokens allow ordinary chat with denied identity; disabled verification ignores tokens and also denies identity. Reserved authorization aliases and token metadata are stripped recursively, and the access header is removed before chat logging. Both streaming and non-streaming payloads finish with server-owned top-level `user_authorization_verified`, `user_authorization_mode`, `user_authorized_groups`, `user_tid`, `user_oid`, `user_sub`, `user_token_expires_at`: accepted tokens produce `true`, `entra_delegated`, a UUID-only group array, verified IDs and integer expiry seconds; absent/disabled tokens produce `false`, `none`, `[]`, and null IDs/expiry. Missing, malformed or overage groups become `[]` with no group lookup. Legacy user ID/email/name/role remain presentation metadata only: an admin role never grants JEMS. Tokens are not forwarded or persisted; parent-owned native workflows decide JEMS access from this trusted contract.
+
 #### N8N_WEBHOOK_BEARER_TOKEN (Optional)
 
 Secures communication between the bridge and n8n Webhook nodes using Bearer token authentication.
