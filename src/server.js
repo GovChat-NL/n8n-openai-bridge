@@ -25,6 +25,7 @@ const { createErrorResponse } = require('./utils/errorResponse');
 // Middleware
 const requestLogger = require('./middleware/requestLogger');
 const authenticate = require('./middleware/authenticate');
+const { createEntraIdentity } = require('./middleware/entraIdentity');
 const requestId = require('./middleware/requestId');
 const createRateLimiters = require('./middleware/rateLimiter');
 
@@ -54,14 +55,15 @@ app.use(express.json({ limit: bootstrap.config.requestBodyLimit }));
 // Request ID tracking (must be early in the chain)
 app.use(requestId());
 
-// Request logging middleware
-app.use(requestLogger(bootstrap.config));
-
 // Public routes (no authentication required)
-app.use('/health', rateLimiters.health, healthRoute);
+app.use('/health', requestLogger(bootstrap.config), rateLimiters.health, healthRoute);
 
 // Apply authentication to all subsequent routes
 app.use(authenticate(bootstrap.config));
+app.use('/v1/chat/completions', createEntraIdentity(bootstrap.config.entra));
+
+// Log only after verification has removed the credential header and body aliases.
+app.use(requestLogger(bootstrap.config));
 
 // Protected routes (authentication required)
 app.use('/admin/reload', rateLimiters.standard, adminReloadRoute);

@@ -43,6 +43,7 @@ jobs:
         id: version
         run: |
           TAG="${{ inputs.version_tag }}"
+          OWNER="${GITHUB_REPOSITORY_OWNER,,}"
           VERSION=${TAG#v}
           echo "tag=$TAG" >> $GITHUB_OUTPUT
           echo "version=$VERSION" >> $GITHUB_OUTPUT
@@ -50,14 +51,14 @@ jobs:
           echo "minor=$(echo $VERSION | cut -d. -f1,2)" >> $GITHUB_OUTPUT
 
           # Determine tags to push
-          TAGS="ghcr.io/${{ github.repository_owner }}/n8n-openai-bridge:$VERSION"
+          TAGS="ghcr.io/$OWNER/n8n-openai-bridge:$VERSION"
           TAGS="$TAGS
-          ghcr.io/${{ github.repository_owner }}/n8n-openai-bridge:$(echo $VERSION | cut -d. -f1,2)"
+          ghcr.io/$OWNER/n8n-openai-bridge:$(echo $VERSION | cut -d. -f1,2)"
           TAGS="$TAGS
-          ghcr.io/${{ github.repository_owner }}/n8n-openai-bridge:$(echo $VERSION | cut -d. -f1)"
+          ghcr.io/$OWNER/n8n-openai-bridge:$(echo $VERSION | cut -d. -f1)"
 
           if [[ "${{ inputs.push_latest }}" == "true" ]]; then
-            TAGS="ghcr.io/${{ github.repository_owner }}/n8n-openai-bridge:latest
+            TAGS="ghcr.io/$OWNER/n8n-openai-bridge:latest
           $TAGS"
           fi
 

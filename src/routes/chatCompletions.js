@@ -20,6 +20,7 @@ const express = require('express');
 const { v4: uuidv4 } = require('uuid');
 const { extractSessionId } = require('../utils/sessionExtractor');
 const { extractUserContext } = require('../utils/userExtractor');
+const { identityContext } = require('../middleware/entraIdentity');
 const { validateChatCompletionRequest } = require('../utils/requestValidator');
 const { createErrorResponse } = require('../utils/errorResponse');
 const { debugSessionDetection } = require('../utils/debugSession');
@@ -97,6 +98,7 @@ router.post('/', async (req, res) => {
 
   // Extract user context using service
   const userContext = extractUserContext(req, config);
+  Object.defineProperty(userContext, identityContext, { value: req[identityContext] });
 
   if (config.logRequests) {
     console.log(`Session ID: ${sessionId}`);
